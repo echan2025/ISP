@@ -22,20 +22,21 @@ namespace IfcToGeoJson
 
     class Program
     {
-        private static readonly ILoggerFactory LoggerFactory =
-            Microsoft.Extensions.Logging.LoggerFactory.Create(builder => builder.AddConsole());
-        private static readonly ILogger Logger = LoggerFactory.CreateLogger<Program>();
-
+        private static ILoggerFactory? LoggerFactory;
+        private static ILogger? Logger;
         private const double CoordinateScale = 0.00001;
 
         static int Main(string[] args)
         {
-            XbimServices.Current.ConfigureServices(services =>
-                services.AddXbimToolkit(config => config.AddLoggerFactory(LoggerFactory)));
+            LoggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(builder => builder.AddConsole());
+            Logger = LoggerFactory.CreateLogger<Program>();
+
+            XbimServices.Current.ConfigureServices(s =>
+                s.AddXbimToolkit(c => c.AddLoggerFactory(LoggerFactory)));
 
             if (args.Length < 2)
             {
-                Logger.LogError("Usage: IfcToGeoJson <ifcPath> <outputPath> [elementGuid]");
+                Logger?.LogError("Usage: IfcToGeoJson <ifcPath> <outputPath> [elementGuid]");
                 return 1;
             }
 
@@ -49,12 +50,12 @@ namespace IfcToGeoJson
                     : ProcessAllElements(ifcPath);
 
                 File.WriteAllText(outputPath, geojson);
-                Logger.LogInformation("Successfully created GeoJSON at: {Path}", outputPath);
+                Logger?.LogInformation("Successfully created GeoJSON at: {Path}", outputPath);
                 return 0;
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, "Conversion failed");
+                Logger?.LogError(ex, "Conversion failed");
                 File.WriteAllText(
                     args.Length >= 2 ? args[1] : "error_output.geojson",
                     JsonConvert.SerializeObject(new
@@ -76,7 +77,12 @@ namespace IfcToGeoJson
                           ?? throw new Exception($"Element {elementGuid} not found");
 
             var context = new Xbim3DModelContext(store);
+            Logger?.LogInformation("Creating geometry context...");
             context.CreateContext();
+
+            var shapes = context.ShapeInstances().Where(s => s.IfcProductLabel == element.EntityLabel).ToList();
+            if (!shapes.Any())
+                Logger?.LogWarning("No shape instances found for element {Guid}", elementGuid);
 
             var result = GetElementGeometry(store, context, element);
             var feature = CreateGeoJsonFeature(elementGuid, element.GetType().Name, result.Polygons);
@@ -93,12 +99,16 @@ namespace IfcToGeoJson
         {
             using var store = IfcStore.Open(ifcPath);
             var context = new Xbim3DModelContext(store);
+            Logger?.LogInformation("Creating geometry context...");
             context.CreateContext();
+
+            var allShapes = context.ShapeInstances().ToList();
+            Logger?.LogInformation("Geometry context contains {Count} shape instances", allShapes.Count);
 
             int productCount = store.Instances
                 .OfType<IIfcProduct>()
                 .Count(p => p.Representation != null);
-            Logger.LogInformation("Found {Count} products with geometry", productCount);
+            Logger?.LogInformation("Found {Count} products with geometry", productCount);
 
             var features = new List<JObject>();
             foreach (var product in store.Instances
@@ -132,7 +142,13 @@ namespace IfcToGeoJson
                                    .Where(si => si.IfcProductLabel == element.EntityLabel)
                                    .ToList();
 
-            Logger.LogInformation("  → Product {Id} has {N} shape instances",
+            if (!instances.Any())
+            {
+                Logger?.LogWarning("→ No shape instances for product {Id}", element.GlobalId);
+                return result;
+            }
+
+            Logger?.LogInformation("  → Product {Id} has {N} shape instances",
                                    element.GlobalId, instances.Count);
 
             foreach (var inst in instances)
@@ -149,63 +165,65 @@ namespace IfcToGeoJson
             var geom = context.ShapeGeometry(instance.ShapeGeometryLabel);
             if (geom == null)
             {
-                Logger.LogWarning("    → No geometry object for label {Label}", instance.ShapeGeometryLabel);
+                Logger?.LogWarning("    → No geometry object for label {Label}", instance.ShapeGeometryLabel);
                 return;
             }
 
-            var geometry = geom.GetType().GetProperty("Geometry")?.GetValue(geom);
-            if (geometry == null)
-            {
-                Logger.LogWarning("    → Geometry property null for label {Label}", instance.ShapeGeometryLabel);
-                return;
-            }
+            var vertices = geom.Vertices?.Cast<XbimPoint3D>().ToList();
+            var faces = geom.Faces?.ToList();
 
-            var vertices = geometry.GetType().GetProperty("Vertices")?.GetValue(geometry) as System.Collections.IList;
-            var faces = geometry.GetType().GetProperty("Faces")?.GetValue(geometry) as System.Collections.IEnumerable;
+            Logger?.LogInformation("→ Geometry Vertices = {V}, Faces = {F}", vertices?.Count ?? 0, faces?.Count ?? 0);
 
             if (vertices == null || faces == null || vertices.Count == 0)
                 return;
 
-            int vCount = vertices.Count;
-
-            foreach (var face in faces.Cast<object>())
+            foreach (var face in faces)
             {
-                int? v0 = GetVertexIndex(face, "V0", vCount);
-                int? v1 = GetVertexIndex(face, "V1", vCount);
-                int? v2 = GetVertexIndex(face, "V2", vCount);
-                if (!v0.HasValue || !v1.HasValue || !v2.HasValue)
-                    continue;
+                Logger?.LogInformation("    Face type: {Type}", face.GetType().FullName);
 
-                var poly = new List<double[]>();
-                AddVertex(poly, vertices[v0.Value]);
-                AddVertex(poly, vertices[v1.Value]);
-                AddVertex(poly, vertices[v2.Value]);
-                if (poly.Count > 0)
+                if (face is Xbim.Common.Geometry.WexBimMeshFace meshFace)
                 {
-                    poly.Add(poly[0]);
-                    result.Polygons.Add(poly);
+                    var indices = meshFace.Indices?.ToArray();
+                    if (indices == null || indices.Length % 3 != 0)
+                    {
+                        Logger?.LogWarning("      → Skipping face due to invalid triangle count");
+                        continue;
+                    }
+
+                    for (int i = 0; i < indices.Length; i += 3)
+                    {
+                        int v0 = indices[i], v1 = indices[i + 1], v2 = indices[i + 2];
+                        if (v0 < 0 || v0 >= vertices.Count || v1 < 0 || v1 >= vertices.Count || v2 < 0 || v2 >= vertices.Count)
+                        {
+                            Logger?.LogWarning("      → Skipping triangle with out-of-bound indices: {V0}, {V1}, {V2}", v0, v1, v2);
+                            continue;
+                        }
+
+                        var points = new[] { vertices[v0], vertices[v1], vertices[v2] };
+
+                        if (points.Any(p => double.IsNaN(p.X) || double.IsInfinity(p.X) ||
+                                            double.IsNaN(p.Y) || double.IsInfinity(p.Y)))
+                        {
+                            Logger?.LogWarning("      → Skipping triangle with invalid coordinate values");
+                            continue;
+                        }
+
+                        var poly = new List<double[]>
+                        {
+                            new[] { vertices[v0].X, vertices[v0].Y },
+                            new[] { vertices[v1].X, vertices[v1].Y },
+                            new[] { vertices[v2].X, vertices[v2].Y },
+                            new[] { vertices[v0].X, vertices[v0].Y }
+                        };
+
+                        result.Polygons.Add(poly);
+                    }
+                }
+                else
+                {
+                    Logger?.LogWarning("      → Skipping non-mesh face of type: {Type}", face.GetType().Name);
                 }
             }
-        }
-
-        private static int? GetVertexIndex(object face, string prop, int max)
-        {
-            var p = face.GetType().GetProperty(prop);
-            var val = p?.GetValue(face) as int?;
-            return (val >= 0 && val < max) ? val : null;
-        }
-
-        private static void AddVertex(List<double[]> poly, object? vert)
-        {
-            if (vert == null) return;
-            double? Get(string n) => (double?)vert.GetType()
-                                                  .GetProperty(n)
-                                                  ?.GetValue(vert);
-            var x = Get("X");
-            var y = Get("Y");
-            var z = Get("Z");
-            if (x.HasValue && y.HasValue && z.HasValue)
-                poly.Add(new[] { x.Value, y.Value, z.Value });
         }
 
         private static JObject CreateGeoJsonFeature(
@@ -218,9 +236,25 @@ namespace IfcToGeoJson
                 foreach (var pt in poly)
                 {
                     var (lon, lat) = TransformCoordinates(pt[0], pt[1]);
-                    ring.Add(new JArray(lon, lat, pt[2]));
+
+                    if (double.IsNaN(lon) || double.IsNaN(lat) ||
+                        double.IsInfinity(lon) || double.IsInfinity(lat))
+                    {
+                        Logger?.LogWarning("→ Skipping point with invalid transformed coordinates: ({X}, {Y}) => ({Lon}, {Lat})", pt[0], pt[1], lon, lat);
+                        continue;
+                    }
+
+                    ring.Add(new JArray(lon, lat));
                 }
-                coords.Add(ring);
+
+                if (ring.Count >= 4)
+                {
+                    coords.Add(ring);
+                }
+                else
+                {
+                    Logger?.LogWarning("→ Skipping ring due to insufficient points");
+                }
             }
 
             return new JObject(
@@ -229,8 +263,7 @@ namespace IfcToGeoJson
                 new JProperty("properties", new JObject(new JProperty("type", type))),
                 new JProperty("geometry", new JObject(
                     new JProperty("type", coords.Count == 1 ? "Polygon" : "MultiPolygon"),
-                    new JProperty("coordinates",
-                                 coords.Count == 1 ? coords[0] : coords)
+                    new JProperty("coordinates", coords.Count == 1 ? coords[0] : coords)
                 ))
             );
         }
@@ -238,9 +271,11 @@ namespace IfcToGeoJson
         private static (double lon, double lat) TransformCoordinates(double x, double y)
         {
             double lon = x * CoordinateScale;
-            lon = (lon % 360 + 540) % 360 - 180;
             double lat = y * CoordinateScale;
-            lat = (lat % 180 + 270) % 180 - 90;
+
+            lon = Math.Max(-180, Math.Min(180, lon));
+            lat = Math.Max(-90, Math.Min(90, lat));
+
             return (lon, lat);
         }
     }
