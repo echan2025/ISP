@@ -1,3 +1,4 @@
+// File: IfcToGeoJson.cs
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -193,14 +194,14 @@ namespace IfcToGeoJson
                     for (int i = 0; i < indices.Length; i += 3)
                     {
                         int v0 = indices[i], v1 = indices[i + 1], v2 = indices[i + 2];
-                        if (v0 < 0 || v0 >= vertices.Count || v1 < 0 || v1 >= vertices.Count || v2 < 0 || v2 >= vertices.Count)
+                        if (v0 < 0 || v1 < 0 || v2 < 0 ||
+                            v0 >= vertices.Count || v1 >= vertices.Count || v2 >= vertices.Count)
                         {
-                            Logger?.LogWarning("      → Skipping triangle with out-of-bound indices: {V0}, {V1}, {V2}", v0, v1, v2);
+                            Logger?.LogWarning("      → Skipping triangle with out-of-bound indices");
                             continue;
                         }
 
                         var points = new[] { vertices[v0], vertices[v1], vertices[v2] };
-
                         if (points.Any(p => double.IsNaN(p.X) || double.IsInfinity(p.X) ||
                                             double.IsNaN(p.Y) || double.IsInfinity(p.Y)))
                         {
@@ -216,6 +217,10 @@ namespace IfcToGeoJson
                             new[] { vertices[v0].X, vertices[v0].Y }
                         };
 
+                        // Skip duplicate/degenerate polygons
+                        if (poly.Distinct(new DoubleArrayComparer()).Count() < 3)
+                            continue;
+
                         result.Polygons.Add(poly);
                     }
                 }
@@ -226,8 +231,7 @@ namespace IfcToGeoJson
             }
         }
 
-        private static JObject CreateGeoJsonFeature(
-            string id, string type, List<List<double[]>> polys)
+        private static JObject CreateGeoJsonFeature(string id, string type, List<List<double[]>> polys)
         {
             var coords = new JArray();
             foreach (var poly in polys)
@@ -236,25 +240,9 @@ namespace IfcToGeoJson
                 foreach (var pt in poly)
                 {
                     var (lon, lat) = TransformCoordinates(pt[0], pt[1]);
-
-                    if (double.IsNaN(lon) || double.IsNaN(lat) ||
-                        double.IsInfinity(lon) || double.IsInfinity(lat))
-                    {
-                        Logger?.LogWarning("→ Skipping point with invalid transformed coordinates: ({X}, {Y}) => ({Lon}, {Lat})", pt[0], pt[1], lon, lat);
-                        continue;
-                    }
-
                     ring.Add(new JArray(lon, lat));
                 }
-
-                if (ring.Count >= 4)
-                {
-                    coords.Add(ring);
-                }
-                else
-                {
-                    Logger?.LogWarning("→ Skipping ring due to insufficient points");
-                }
+                coords.Add(new JArray(new JArray(ring)));
             }
 
             return new JObject(
@@ -262,8 +250,8 @@ namespace IfcToGeoJson
                 new JProperty("id", id),
                 new JProperty("properties", new JObject(new JProperty("type", type))),
                 new JProperty("geometry", new JObject(
-                    new JProperty("type", coords.Count == 1 ? "Polygon" : "MultiPolygon"),
-                    new JProperty("coordinates", coords.Count == 1 ? coords[0] : coords)
+                    new JProperty("type", "MultiPolygon"),
+                    new JProperty("coordinates", coords)
                 ))
             );
         }
@@ -272,11 +260,33 @@ namespace IfcToGeoJson
         {
             double lon = x * CoordinateScale;
             double lat = y * CoordinateScale;
-
-            lon = Math.Max(-180, Math.Min(180, lon));
-            lat = Math.Max(-90, Math.Min(90, lat));
-
+            lon = Math.Clamp(lon, -180, 180);
+            lat = Math.Clamp(lat, -90, 90);
             return (lon, lat);
+        }
+
+        private class DoubleArrayComparer : IEqualityComparer<double[]>
+        {
+            public bool Equals(double[]? a, double[]? b)
+            {
+                if (a == null || b == null || a.Length != b.Length) return false;
+                for (int i = 0; i < a.Length; i++)
+                {
+                    if (Math.Abs(a[i] - b[i]) > 1e-9) return false;
+                }
+                return true;
+            }
+
+            public int GetHashCode(double[] obj)
+            {
+                unchecked
+                {
+                    int hash = 17;
+                    foreach (var val in obj)
+                        hash = hash * 31 + val.GetHashCode();
+                    return hash;
+                }
+            }
         }
     }
 }
