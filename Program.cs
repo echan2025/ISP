@@ -5,10 +5,12 @@ using System.Linq;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Xbim.Common;
+using Xbim.Common.Configuration;
+using Xbim.Common.Geometry;
 using Xbim.Ifc;
 using Xbim.Ifc4.Interfaces;
 using Xbim.ModelGeometry.Scene;
-using Xbim.Common.Geometry;
 
 namespace IfcToGeoJson
 {
@@ -20,17 +22,17 @@ namespace IfcToGeoJson
 
     class Program
     {
-        private static readonly ILoggerFactory LoggerFactory = 
+        private static readonly ILoggerFactory LoggerFactory =
             Microsoft.Extensions.Logging.LoggerFactory.Create(builder => builder.AddConsole());
         private static readonly ILogger Logger = LoggerFactory.CreateLogger<Program>();
 
-        // Configuration
         private const double CoordinateScale = 0.00001;
-        private const double DefaultLon = -0.127758;
-        private const double DefaultLat = 51.507351;
 
         static int Main(string[] args)
         {
+            XbimServices.Current.ConfigureServices(services =>
+                services.AddXbimToolkit(config => config.AddLoggerFactory(LoggerFactory)));
+
             if (args.Length < 2)
             {
                 Logger.LogError("Usage: IfcToGeoJson <ifcPath> <outputPath> [elementGuid]");
@@ -39,56 +41,52 @@ namespace IfcToGeoJson
 
             try
             {
-                string geojson;
-                if (args.Length > 2)
-                {
-                    Logger.LogInformation("Processing single element: {Guid}", args[2]);
-                    geojson = ProcessSingleElement(args[0], args[2]);
-                }
-                else
-                {
-                    Logger.LogInformation("Processing all elements");
-                    geojson = ProcessAllElements(args[0]);
-                }
+                bool single = args.Length > 2;
+                string ifcPath = args[0];
+                string outputPath = args[1];
+                string geojson = single
+                    ? ProcessSingleElement(ifcPath, args[2])
+                    : ProcessAllElements(ifcPath);
 
-                File.WriteAllText(args[1], geojson);
-                Logger.LogInformation("Successfully created GeoJSON at: {Path}", args[1]);
+                File.WriteAllText(outputPath, geojson);
+                Logger.LogInformation("Successfully created GeoJSON at: {Path}", outputPath);
                 return 0;
             }
             catch (Exception ex)
             {
                 Logger.LogError(ex, "Conversion failed");
-                File.WriteAllText(args[1], CreateErrorGeoJson(ex));
+                File.WriteAllText(
+                    args.Length >= 2 ? args[1] : "error_output.geojson",
+                    JsonConvert.SerializeObject(new
+                    {
+                        type = "FeatureCollection",
+                        features = new object[0],
+                        error = ex.Message,
+                        stackTrace = ex.StackTrace
+                    }, Formatting.Indented)
+                );
                 return 1;
             }
-        }
-
-        private static string CreateErrorGeoJson(Exception ex)
-        {
-            return JsonConvert.SerializeObject(new
-            {
-                type = "FeatureCollection",
-                features = new object[0],
-                error = ex.Message,
-                stackTrace = ex.StackTrace
-            }, Formatting.Indented);
         }
 
         public static string ProcessSingleElement(string ifcPath, string elementGuid)
         {
             using var store = IfcStore.Open(ifcPath);
-            var element = store.Instances.FirstOrDefault<IIfcProduct>(e => e.GlobalId == elementGuid);
-            
-            if (element == null)
-            {
-                throw new Exception($"Element with GUID {elementGuid} not found");
-            }
+            var element = store.Instances.FirstOrDefault<IIfcProduct>(e => e.GlobalId == elementGuid)
+                          ?? throw new Exception($"Element {elementGuid} not found");
 
             var context = new Xbim3DModelContext(store);
             context.CreateContext();
 
             var result = GetElementGeometry(store, context, element);
-            return CreateGeoJson(result, elementGuid);
+            var feature = CreateGeoJsonFeature(elementGuid, element.GetType().Name, result.Polygons);
+
+            var geojson = new JObject(
+                new JProperty("type", "FeatureCollection"),
+                new JProperty("features", new JArray(feature))
+            );
+
+            return geojson.ToString(Formatting.Indented);
         }
 
         public static string ProcessAllElements(string ifcPath)
@@ -97,8 +95,15 @@ namespace IfcToGeoJson
             var context = new Xbim3DModelContext(store);
             context.CreateContext();
 
+            int productCount = store.Instances
+                .OfType<IIfcProduct>()
+                .Count(p => p.Representation != null);
+            Logger.LogInformation("Found {Count} products with geometry", productCount);
+
             var features = new List<JObject>();
-            foreach (var product in store.Instances.OfType<IIfcProduct>().Where(p => p.Representation != null))
+            foreach (var product in store.Instances
+                                         .OfType<IIfcProduct>()
+                                         .Where(p => p.Representation != null))
             {
                 var result = GetElementGeometry(store, context, product);
                 if (result.Polygons.Any())
@@ -117,139 +122,125 @@ namespace IfcToGeoJson
             ).ToString(Formatting.Indented);
         }
 
-        private static GeometryResult GetElementGeometry(IfcStore store, Xbim3DModelContext context, IIfcProduct element)
+        private static GeometryResult GetElementGeometry(
+            IfcStore store,
+            Xbim3DModelContext context,
+            IIfcProduct element)
         {
             var result = new GeometryResult();
+            var instances = context.ShapeInstances()
+                                   .Where(si => si.IfcProductLabel == element.EntityLabel)
+                                   .ToList();
 
-            try
-            {
-                foreach (var instance in context.ShapeInstances()
-                    .Where(si => si.IfcProductLabel == element.EntityLabel))
-                {
-                    ProcessShapeInstance(context, instance, result);
-                }
-            }
-            catch (Exception ex)
-            {
-                result.Error = $"Error processing geometry: {ex.Message}";
-                Logger.LogError(ex, "Error processing element {Guid}", element.GlobalId);
-            }
+            Logger.LogInformation("  → Product {Id} has {N} shape instances",
+                                   element.GlobalId, instances.Count);
+
+            foreach (var inst in instances)
+                ProcessShapeInstance(context, inst, result);
 
             return result;
         }
 
-        private static void ProcessShapeInstance(Xbim3DModelContext context, IXbimShapeInstanceData instance, GeometryResult result)
+        private static void ProcessShapeInstance(
+            Xbim3DModelContext context,
+            IXbimShapeInstanceData instance,
+            GeometryResult result)
         {
-            var geom = context.ShapeGeometry(instance);
-            if (geom == null) return;
+            var geom = context.ShapeGeometry(instance.ShapeGeometryLabel);
+            if (geom == null)
+            {
+                Logger.LogWarning("    → No geometry object for label {Label}", instance.ShapeGeometryLabel);
+                return;
+            }
 
-            // Get geometry through reflection
             var geometry = geom.GetType().GetProperty("Geometry")?.GetValue(geom);
-            if (geometry == null) return;
+            if (geometry == null)
+            {
+                Logger.LogWarning("    → Geometry property null for label {Label}", instance.ShapeGeometryLabel);
+                return;
+            }
 
             var vertices = geometry.GetType().GetProperty("Vertices")?.GetValue(geometry) as System.Collections.IList;
             var faces = geometry.GetType().GetProperty("Faces")?.GetValue(geometry) as System.Collections.IEnumerable;
 
-            if (vertices == null || faces == null) return;
+            if (vertices == null || faces == null || vertices.Count == 0)
+                return;
 
-            foreach (var face in faces)
+            int vCount = vertices.Count;
+
+            foreach (var face in faces.Cast<object>())
             {
-                if (face == null) continue;
-                
-                var v0 = GetVertexIndex(face, "V0", vertices.Count);
-                var v1 = GetVertexIndex(face, "V1", vertices.Count);
-                var v2 = GetVertexIndex(face, "V2", vertices.Count);
+                int? v0 = GetVertexIndex(face, "V0", vCount);
+                int? v1 = GetVertexIndex(face, "V1", vCount);
+                int? v2 = GetVertexIndex(face, "V2", vCount);
+                if (!v0.HasValue || !v1.HasValue || !v2.HasValue)
+                    continue;
 
-                if (!v0.HasValue || !v1.HasValue || !v2.HasValue) continue;
-
-                var polygon = new List<double[]>();
-                AddVertex(polygon, vertices[v0.Value]);
-                AddVertex(polygon, vertices[v1.Value]);
-                AddVertex(polygon, vertices[v2.Value]);
-                
-                if (polygon.Count > 0)
+                var poly = new List<double[]>();
+                AddVertex(poly, vertices[v0.Value]);
+                AddVertex(poly, vertices[v1.Value]);
+                AddVertex(poly, vertices[v2.Value]);
+                if (poly.Count > 0)
                 {
-                    polygon.Add(polygon[0]); // Close the polygon
-                    result.Polygons.Add(polygon);
+                    poly.Add(poly[0]);
+                    result.Polygons.Add(poly);
                 }
             }
         }
 
-        private static string CreateGeoJson(GeometryResult result, string elementGuid)
+        private static int? GetVertexIndex(object face, string prop, int max)
         {
-            if (!result.Polygons.Any())
-            {
-                return JsonConvert.SerializeObject(new { error = "No geometry data available" });
-            }
-
-            var feature = CreateGeoJsonFeature(
-                elementGuid,
-                "IFC Element",
-                result.Polygons
-            );
-
-            return feature.ToString(Formatting.Indented);
+            var p = face.GetType().GetProperty(prop);
+            var val = p?.GetValue(face) as int?;
+            return (val >= 0 && val < max) ? val : null;
         }
 
-        private static int? GetVertexIndex(object face, string propName, int vertexCount)
+        private static void AddVertex(List<double[]> poly, object? vert)
         {
-            var prop = face.GetType().GetProperty(propName);
-            if (prop == null) return null;
-            
-            var value = prop.GetValue(face) as int?;
-            return value >= 0 && value < vertexCount ? value : null;
-        }
-
-        private static void AddVertex(List<double[]> polygon, object? vertex)
-        {
-            if (vertex == null) return;
-
-            double? GetCoord(string name) => 
-                vertex.GetType().GetProperty(name)?.GetValue(vertex) as double?;
-
-            var x = GetCoord("X");
-            var y = GetCoord("Y");
-            var z = GetCoord("Z");
-
+            if (vert == null) return;
+            double? Get(string n) => (double?)vert.GetType()
+                                                  .GetProperty(n)
+                                                  ?.GetValue(vert);
+            var x = Get("X");
+            var y = Get("Y");
+            var z = Get("Z");
             if (x.HasValue && y.HasValue && z.HasValue)
-                polygon.Add(new[] { x.Value, y.Value, z.Value });
+                poly.Add(new[] { x.Value, y.Value, z.Value });
         }
 
-        private static JObject CreateGeoJsonFeature(string id, string type, List<List<double[]>> polygons)
+        private static JObject CreateGeoJsonFeature(
+            string id, string type, List<List<double[]>> polys)
         {
-            var coordinates = new JArray();
-
-            foreach (var polygon in polygons)
+            var coords = new JArray();
+            foreach (var poly in polys)
             {
                 var ring = new JArray();
-                foreach (var point in polygon)
+                foreach (var pt in poly)
                 {
-                    var (lon, lat) = TransformCoordinates(point[0], point[1]);
-                    ring.Add(new JArray(lon, lat, point[2]));
+                    var (lon, lat) = TransformCoordinates(pt[0], pt[1]);
+                    ring.Add(new JArray(lon, lat, pt[2]));
                 }
-                coordinates.Add(ring);
+                coords.Add(ring);
             }
 
             return new JObject(
                 new JProperty("type", "Feature"),
                 new JProperty("id", id),
-                new JProperty("properties", new JObject(
-                    new JProperty("type", type))),
+                new JProperty("properties", new JObject(new JProperty("type", type))),
                 new JProperty("geometry", new JObject(
-                    new JProperty("type", coordinates.Count == 1 ? "Polygon" : "MultiPolygon"),
-                    new JProperty("coordinates", coordinates.Count == 1 ? coordinates[0] : coordinates)))
+                    new JProperty("type", coords.Count == 1 ? "Polygon" : "MultiPolygon"),
+                    new JProperty("coordinates",
+                                 coords.Count == 1 ? coords[0] : coords)
+                ))
             );
         }
 
         private static (double lon, double lat) TransformCoordinates(double x, double y)
         {
             double lon = x * CoordinateScale;
+            lon = (lon % 360 + 540) % 360 - 180;
             double lat = y * CoordinateScale;
-
-            // Normalize to valid ranges
-            lon = (lon % 360 + 540) % 360 - 180; // -180 to 180
-            lat = (lat % 180 + 270) % 180 - 90;   // -90 to 90
-
+            lat = (lat % 180 + 270) % 180 - 90;
             return (lon, lat);
         }
     }
