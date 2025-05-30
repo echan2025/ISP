@@ -29,7 +29,12 @@ namespace IfcToGeoJson
 
         static int Main(string[] args)
         {
-            LoggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(builder => builder.AddConsole());
+            LoggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(builder => 
+            {
+                builder
+                    .SetMinimumLevel(LogLevel.Information)
+                    .AddConsole(options => options.IncludeScopes = true);
+            });
             Logger = LoggerFactory.CreateLogger<Program>();
 
             XbimServices.Current.ConfigureServices(s =>
@@ -43,6 +48,7 @@ namespace IfcToGeoJson
 
             try
             {
+                Logger?.LogInformation("Starting conversion of {IfcPath} to {OutputPath}", args[0], args[1]);
                 bool single = args.Length > 2;
                 string ifcPath = args[0];
                 string outputPath = args[1];
@@ -152,8 +158,31 @@ namespace IfcToGeoJson
             Logger?.LogInformation("  → Product {Id} has {N} shape instances",
                                    element.GlobalId, instances.Count);
 
+            // Log the product type and representation
+            Logger?.LogInformation("  → Product type: {Type}", element.GetType().Name);
+            if (element.Representation != null)
+            {
+                Logger?.LogInformation("  → Representation type: {Type}", element.Representation.GetType().Name);
+                foreach (var rep in element.Representation.Representations)
+                {
+                    Logger?.LogInformation("    → Representation item type: {Type}", rep.GetType().Name);
+                    foreach (var item in rep.Items)
+                    {
+                        Logger?.LogInformation("      → Item type: {Type}", item.GetType().Name);
+                    }
+                }
+            }
+
             foreach (var inst in instances)
+            {
+                Logger?.LogInformation("  → Processing shape instance:");
+                Logger?.LogInformation("    → Type: {Type}", inst.GetType().Name);
+                Logger?.LogInformation("    → Representation type: {Type}", inst.RepresentationType);
+                Logger?.LogInformation("    → Style label: {Label}", inst.StyleLabel);
+                Logger?.LogInformation("    → Product label: {Label}", inst.IfcProductLabel);
+                Logger?.LogInformation("    → Shape geometry label: {Label}", inst.ShapeGeometryLabel);
                 ProcessShapeInstance(context, inst, result);
+            }
 
             return result;
         }
@@ -173,55 +202,68 @@ namespace IfcToGeoJson
             var vertices = geom.Vertices?.Cast<XbimPoint3D>().ToList();
             var faces = geom.Faces?.ToList();
 
-            Logger?.LogInformation("→ Geometry Vertices = {V}, Faces = {F}", vertices?.Count ?? 0, faces?.Count ?? 0);
+            Logger?.LogInformation("    → Geometry details:");
+            Logger?.LogInformation("      → Vertices: {Count}", vertices?.Count ?? 0);
+            Logger?.LogInformation("      → Faces: {Count}", faces?.Count ?? 0);
+
+            if (vertices?.Count > 0)
+            {
+                for (int i = 0; i < Math.Min(5, vertices.Count); i++)
+                {
+                    Logger?.LogInformation("      → Vertex {Index}: X={X}, Y={Y}, Z={Z}", 
+                        i, vertices[i].X, vertices[i].Y, vertices[i].Z);
+                }
+            }
 
             if (vertices == null || faces == null || vertices.Count == 0)
                 return;
 
+            // Project all vertices to 2D using best-fit plane (PCA)
+            var projected2D = ProjectToBestFitPlane(vertices);
+
             foreach (var face in faces)
             {
-                Logger?.LogInformation("    Face type: {Type}", face.GetType().FullName);
+                Logger?.LogInformation("    → Processing face of type: {Type}", face.GetType().Name);
 
                 if (face is Xbim.Common.Geometry.WexBimMeshFace meshFace)
                 {
                     var indices = meshFace.Indices?.ToArray();
-                    if (indices == null || indices.Length % 3 != 0)
+                    if (indices == null || indices.Length < 3)
                     {
-                        Logger?.LogWarning("      → Skipping face due to invalid triangle count");
+                        Logger?.LogWarning("      → Skipping face due to insufficient indices");
                         continue;
                     }
 
-                    for (int i = 0; i < indices.Length; i += 3)
+                    Logger?.LogInformation("      → Face has {Count} indices", indices.Length);
+                    Logger?.LogInformation("      → First few indices: {Indices}", 
+                        string.Join(", ", indices.Take(Math.Min(10, indices.Length))));
+
+                    var poly = new List<double[]>();
+                    var uniqueIndices = new HashSet<int>();
+
+                    foreach (var index in indices)
                     {
-                        int v0 = indices[i], v1 = indices[i + 1], v2 = indices[i + 2];
-                        if (v0 < 0 || v1 < 0 || v2 < 0 ||
-                            v0 >= vertices.Count || v1 >= vertices.Count || v2 >= vertices.Count)
+                        if (index < 0 || index >= projected2D.Count)
                         {
-                            Logger?.LogWarning("      → Skipping triangle with out-of-bound indices");
+                            Logger?.LogWarning("      → Skipping invalid vertex index: {Index}", index);
                             continue;
                         }
-
-                        var points = new[] { vertices[v0], vertices[v1], vertices[v2] };
-                        if (points.Any(p => double.IsNaN(p.X) || double.IsInfinity(p.X) ||
-                                            double.IsNaN(p.Y) || double.IsInfinity(p.Y)))
+                        if (uniqueIndices.Add(index))
                         {
-                            Logger?.LogWarning("      → Skipping triangle with invalid coordinate values");
-                            continue;
+                            var pt2d = projected2D[index];
+                            poly.Add(new[] { pt2d[0], pt2d[1] });
                         }
+                    }
 
-                        var poly = new List<double[]>
-                        {
-                            new[] { vertices[v0].X, vertices[v0].Y },
-                            new[] { vertices[v1].X, vertices[v1].Y },
-                            new[] { vertices[v2].X, vertices[v2].Y },
-                            new[] { vertices[v0].X, vertices[v0].Y }
-                        };
-
-                        // Skip duplicate/degenerate polygons
-                        if (poly.Distinct(new DoubleArrayComparer()).Count() < 3)
-                            continue;
-
+                    if (poly.Count >= 3)
+                    {
+                        poly.Add(poly[0]);
                         result.Polygons.Add(poly);
+                        Logger?.LogInformation("      → Added projected polygon with {Count} points", poly.Count);
+                    }
+                    else
+                    {
+                        Logger?.LogWarning("      → Skipping face with insufficient unique points: {Count}", poly.Count);
                     }
                 }
                 else
@@ -229,6 +271,79 @@ namespace IfcToGeoJson
                     Logger?.LogWarning("      → Skipping non-mesh face of type: {Type}", face.GetType().Name);
                 }
             }
+
+            Logger?.LogInformation("    → Total polygons created: {Count}", result.Polygons.Count);
+        }
+
+        // Helper: Project 3D points to best-fit plane using PCA
+        private static List<double[]> ProjectToBestFitPlane(List<XbimPoint3D> points)
+        {
+            // Compute centroid
+            double cx = points.Average(p => p.X);
+            double cy = points.Average(p => p.Y);
+            double cz = points.Average(p => p.Z);
+            var centered = points.Select(p => new[] { p.X - cx, p.Y - cy, p.Z - cz }).ToList();
+
+            // Compute covariance matrix
+            double[,] cov = new double[3, 3];
+            foreach (var v in centered)
+            {
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++)
+                        cov[i, j] += v[i] * v[j];
+            }
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    cov[i, j] /= points.Count;
+
+            // Eigen decomposition (find principal axes)
+            // We'll use a simple power iteration for the largest two eigenvectors
+            var pc1 = PowerIteration(cov, 100);
+            var cov2 = SubtractOuterProduct(cov, pc1);
+            var pc2 = PowerIteration(cov2, 100);
+
+            // Project each point onto the first two principal axes
+            var projected = new List<double[]>();
+            foreach (var v in centered)
+            {
+                double x = Dot(v, pc1);
+                double y = Dot(v, pc2);
+                projected.Add(new[] { x, y });
+            }
+            return projected;
+        }
+
+        // Helper: Power iteration to find dominant eigenvector
+        private static double[] PowerIteration(double[,] m, int steps)
+        {
+            var v = new double[] { 1, 0, 0 };
+            for (int s = 0; s < steps; s++)
+            {
+                var mv = new double[3];
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++)
+                        mv[i] += m[i, j] * v[j];
+                double norm = Math.Sqrt(mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]);
+                for (int i = 0; i < 3; i++)
+                    v[i] = mv[i] / norm;
+            }
+            return v;
+        }
+
+        // Helper: Subtract outer product of a vector from a matrix
+        private static double[,] SubtractOuterProduct(double[,] m, double[] v)
+        {
+            var result = (double[,])m.Clone();
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    result[i, j] -= v[i] * v[j];
+            return result;
+        }
+
+        // Helper: Dot product
+        private static double Dot(double[] a, double[] b)
+        {
+            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         }
 
         private static JObject CreateGeoJsonFeature(string id, string type, List<List<double[]>> polys)
@@ -242,7 +357,7 @@ namespace IfcToGeoJson
                     var (lon, lat) = TransformCoordinates(pt[0], pt[1]);
                     ring.Add(new JArray(lon, lat));
                 }
-                coords.Add(new JArray(new JArray(ring)));
+                coords.Add(ring);
             }
 
             return new JObject(
@@ -250,18 +365,17 @@ namespace IfcToGeoJson
                 new JProperty("id", id),
                 new JProperty("properties", new JObject(new JProperty("type", type))),
                 new JProperty("geometry", new JObject(
-                    new JProperty("type", "MultiPolygon"),
-                    new JProperty("coordinates", coords)
+                    new JProperty("type", "Polygon"),
+                    new JProperty("coordinates", new JArray(coords))
                 ))
             );
         }
 
         private static (double lon, double lat) TransformCoordinates(double x, double y)
         {
-            double lon = x * CoordinateScale;
-            double lat = y * CoordinateScale;
-            lon = Math.Clamp(lon, -180, 180);
-            lat = Math.Clamp(lat, -90, 90);
+            // Remove the scaling factor for now to see the actual coordinates
+            double lon = x;
+            double lat = y;
             return (lon, lat);
         }
 
@@ -287,6 +401,70 @@ namespace IfcToGeoJson
                     return hash;
                 }
             }
+        }
+
+        private static void ProcessSweptDiskSolid(List<XbimPoint3D> vertices, GeometryResult result)
+        {
+            Logger?.LogInformation("Processing swept disk solid with {VertexCount} vertices", vertices.Count);
+
+            // Instead of creating circles, we'll use the actual mesh vertices
+            // Group vertices by their Z coordinate to find cross-sections
+            var crossSections = vertices
+                .GroupBy(v => Math.Round(v.Z, 6))
+                .OrderBy(g => g.Key)
+                .Select(g => g.ToList())
+                .ToList();
+
+            Logger?.LogInformation("Found {SectionCount} cross-sections", crossSections.Count);
+
+            if (crossSections.Count < 2)
+            {
+                Logger?.LogWarning("Not enough cross-sections to create a swept path");
+                return;
+            }
+
+            // Create polygons for each cross-section
+            foreach (var section in crossSections)
+            {
+                if (section.Count < 3)
+                {
+                    Logger?.LogWarning("Cross-section has too few points: {Count}", section.Count);
+                    continue;
+                }
+
+                var poly = new List<double[]>();
+                foreach (var point in section)
+                {
+                    poly.Add(new[] { point.X, point.Y });
+                }
+                // Close the polygon
+                poly.Add(new[] { section[0].X, section[0].Y });
+                result.Polygons.Add(poly);
+            }
+
+            // Create connecting faces between cross-sections
+            for (int i = 0; i < crossSections.Count - 1; i++)
+            {
+                var currentSection = crossSections[i];
+                var nextSection = crossSections[i + 1];
+
+                // Create triangular faces between sections
+                for (int j = 0; j < currentSection.Count; j++)
+                {
+                    int nextJ = (j + 1) % currentSection.Count;
+                    var poly = new List<double[]>
+                    {
+                        new[] { currentSection[j].X, currentSection[j].Y },
+                        new[] { nextSection[j].X, nextSection[j].Y },
+                        new[] { nextSection[nextJ].X, nextSection[nextJ].Y },
+                        new[] { currentSection[nextJ].X, currentSection[nextJ].Y },
+                        new[] { currentSection[j].X, currentSection[j].Y }
+                    };
+                    result.Polygons.Add(poly);
+                }
+            }
+
+            Logger?.LogInformation("Created {PolygonCount} polygons", result.Polygons.Count);
         }
     }
 }
